@@ -88,12 +88,12 @@ ENGINES = {
     },
     "artemis": {
         "label": "Artemis (from scratch)",
-        "binary": f"{ENGINES_ROOT}/artemis/build/pfstool",
+        "binary": f"{ENGINES_ROOT}/artemis/build/agame",
         "state": "partial",
         "signatures": [("*.pfs", 10), ("*.ast", 8), ("*.iet", 8)],
         "extras": [],
-        "notes": "written from scratch: the .pfs archive reader/writer works, "
-                 "the .ast bytecode and the runtime are next; use `pfstool list data.pfs`",
+        "notes": "written from scratch: .pfs, .ast, the scenario runtime and a "
+                 "window that plays a script; give agame a .ast to see it run",
     },
 }
 
