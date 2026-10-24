@@ -62,7 +62,8 @@ ENGINES = {
         ],
         "extras": [],
         "notes": "TJS2, XP3, the software renderer, text drawing, the window and the "
-                 "layer tree all work; KAG3's own startup stops at Scripts.execStorage",
+                 "layer tree all work, and KAG3 runs its own scenario: first.ks"
+                 "reaches the screen (krkrrun --screenshot shows it)"
     },
     "reallive": {
         "label": "RealLive → RLVM",
