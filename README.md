@@ -19,6 +19,23 @@ engine it belongs to, remembers it, and starts the right binary the right way.
 The library is JSON under `~/Library/Application Support/gal/library.json`;
 the game folders stay where they are.
 
+## Where the engines stand, verified by `gal verify`
+
+Measured, not claimed - the output of `gal verify` on every data set in the
+library at the end of round 37:
+
+| engine | data set | verdict |
+|---|---|---|
+| NScripter | `testdata/lifegame` (the official OnscripterYuri demo) | **runs** - enters its main loop |
+| NScripter | `testdata/nscripter-sdk/.../サンプル1` | **runs** |
+| NScripter | `.../サンプル2-1`, `2-2`, `3` | **runs** |
+| Ethornell/BGI | the official Lump of Sugar trial (1.669) | **not yet** - the engine identifies it, opens a window and decodes its data, then stops on opcodes that upstream has not implemented for 1.669 (200 of them) |
+| KiriKiri | - | TJS2, XP3, storage, the software renderer, images and text all work; no game data to run, and the layer system still stops on its first fill |
+| RealLive | - | ported in another session, no binary yet |
+| Artemis | - | written from scratch: `.pfs` and `.ast` read and write, no game data to run |
+
+Two engines run real data; the others are honest about where they stop.
+
 ## How detection works
 
 Each engine declares signature files with weights; the engine with the most
