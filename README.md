@@ -11,6 +11,7 @@ engine it belongs to, remembers it, and starts the right binary the right way.
 ./gal list                # the library
 ./gal info <game>         # why the engine was recognised
 ./gal launch <game>       # start it      (--dry-run prints the command)
+./gal verify <game>       # start it headless for a few seconds and report
 ./gal remove <game>       # drop it
 ./gal doctor              # check the binaries and the folders
 ```
@@ -43,6 +44,22 @@ evidence wins, so one generic name does not mis-file a game.
 
 `launch` refuses the engines that cannot run a game yet and says why, instead
 of failing halfway.
+
+## Real data it runs today
+
+Five data sets are registered and pass `gal verify` (headless, no window):
+
+| data set | source |
+|---|---|
+| `testdata/lifegame` | the official OnscripterYuri web demo (`onscript.nt2`, an encrypted script) |
+| `testdata/nscripter-sdk/n18/.../サンプル1` | NScripter final SDK, Lua value passing |
+| `.../サンプル2-1` | NScripter final SDK, a square bouncing around |
+| `.../サンプル2-2` | NScripter final SDK, text turned into sprites |
+| `.../サンプル3` | NScripter final SDK, the input functions |
+
+The NScripter2 SDK samples are *not* in the list: they are written in
+NScripter 2's Lua dialect, which `verify` correctly reports as
+`Script error, Label "define" is not found`.
 
 ## Verified
 

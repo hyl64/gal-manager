@@ -286,6 +286,55 @@ def cmd_launch(args):
         return 130
 
 
+def cmd_verify(args):
+    """Start the engine headless for a few seconds and report what it said."""
+    lib = load_library()
+    game = lib["games"].get(args.game)
+    if game is None:
+        print(f"gal: 库里没有 {args.game}", file=sys.stderr)
+        return 1
+    engine = game["engine"]
+    info = ENGINES.get(engine, {})
+    if engine not in RUNNABLE:
+        print(f"gal: {info.get('label', engine)} 还跑不了游戏", file=sys.stderr)
+        return 1
+    argv, cwd = build_command(args.game, game, [])
+    if not os.path.exists(argv[0]) or not os.path.isdir(cwd):
+        print("gal: 二进制或游戏目录不存在", file=sys.stderr)
+        return 1
+    env = dict(os.environ, SDL_VIDEODRIVER="dummy", SDL_AUDIODRIVER="dummy")
+    print(f"试跑 {args.seconds}s（无窗口）: {args.game}")
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace")
+    except OSError as e:
+        print(f"gal: 启动失败: {e}", file=sys.stderr)
+        return 1
+    try:
+        out, _ = proc.communicate(timeout=args.seconds)
+        # the engine exiting on its own inside the window means it ran a script
+        # that ends, which is a pass too
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        timed_out = True
+    lines = [l for l in (out or "").splitlines() if l.strip()]
+    errors = [l for l in lines if "error" in l.lower() or "can't open font" in l.lower()]
+    if errors:
+        print("  ✗ 有报错:")
+        for l in errors[:5]:
+            print(f"    {l.strip()}")
+        print("  结论: 跑不起来")
+        return 1
+    print(f"  {'✓ 进入主循环' if timed_out else '✓ 脚本正常结束'} ({len(lines)} 行输出)")
+    for l in lines[:3]:
+        print(f"    {l.strip()}")
+    print("  结论: 可以运行")
+    return 0
+
+
 def cmd_remove(args):
     lib = load_library()
     if args.game not in lib["games"]:
@@ -346,6 +395,11 @@ def main(argv):
     p.add_argument("--dry-run", action="store_true", help="只打印命令，不启动")
     p.add_argument("extra", nargs="*", help="传给引擎的额外参数")
     p.set_defaults(func=cmd_launch)
+
+    p = sub.add_parser("verify", help="试跑一个游戏看能不能起来")
+    p.add_argument("game")
+    p.add_argument("--seconds", type=int, default=5, help="试跑多少秒（默认 5）")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("remove", help="从库里移除")
     p.add_argument("game")
