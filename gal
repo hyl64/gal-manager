@@ -61,8 +61,8 @@ ENGINES = {
             ("*.xp3", 6), ("*.tjs", 3),
         ],
         "extras": [],
-        "notes": "TJS2 and the XP3 layer run natively; the window is not there yet, "
-                 "so use `krkrpack list data.xp3` to see inside",
+        "notes": "TJS2, XP3, the software renderer, text drawing, the window and the "
+                 "layer tree all work; KAG3's own startup stops at Scripts.execStorage",
     },
     "reallive": {
         "label": "RealLive → RLVM",
