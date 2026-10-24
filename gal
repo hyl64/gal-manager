@@ -87,12 +87,13 @@ ENGINES = {
         "notes": "the engine takes the game folder as its working directory",
     },
     "artemis": {
-        "label": "Artemis (no runtime yet)",
-        "binary": None,
-        "state": "missing",
+        "label": "Artemis (from scratch)",
+        "binary": f"{ENGINES_ROOT}/artemis/build/pfstool",
+        "state": "partial",
         "signatures": [("*.pfs", 10), ("*.ast", 8), ("*.iet", 8)],
         "extras": [],
-        "notes": "nothing implements this engine yet; it is the from-scratch target",
+        "notes": "written from scratch: the .pfs archive reader/writer works, "
+                 "the .ast bytecode and the runtime are next; use `pfstool list data.pfs`",
     },
 }
 
