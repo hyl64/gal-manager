@@ -98,7 +98,8 @@ ENGINES = {
 }
 
 # engines whose games run today, so `launch` can be honest about the rest
-RUNNABLE = {"nscripter", "bgi"}
+RUNNABLE = {
+    "artemis","nscripter", "bgi"}
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +251,19 @@ def build_command(name, game, extra):
     if game["engine"] == "nscripter":
         argv = [binary, "--root", path] + info["extras"]
         return argv, path
+    if game["engine"] == "artemis":
+        # the player takes a script; the game's own are under root/script
+        script = None
+        for root, dirs, files in os.walk(path):
+            for f in sorted(files):
+                if f.endswith(".ast"):
+                    script = os.path.join(root, f)
+                    break
+            if script:
+                break
+        if script is None:
+            return [binary], path
+        return [binary, script] + info["extras"], path
     if game["engine"] == "bgi":
         # the BGI engine reads the game's files from its working directory
         return [binary] + info["extras"], path
@@ -402,7 +416,7 @@ def main(argv):
     p.add_argument("game")
     p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("launch", help="启动游戏")
+    p = sub.add_parser("play", aliases=["launch"], help="启动游戏")
     p.add_argument("game")
     p.add_argument("--dry-run", action="store_true", help="只打印命令，不启动")
     p.add_argument("extra", nargs="*", help="传给引擎的额外参数")
