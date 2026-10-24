@@ -168,7 +168,7 @@ def cmd_engines(args):
         if binary is None:
             state = "缺引擎"
         elif os.path.exists(binary):
-            state = "可运行" if info["state"] == "ready" else "部分"
+            state = "可运行" if info["state"] in ("ready", "runnable") else "部分"
         else:
             state = "未构建"
         shown = binary.replace(ENGINES_ROOT, "~") if binary else "-"
