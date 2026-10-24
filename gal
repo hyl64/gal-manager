@@ -280,14 +280,6 @@ def build_command(name, game, extra):
             return [binary], path
         return [binary, script] + info["extras"], path
     if game["engine"] == "bgi":
-        # BGI trials often ship as an installer; the engine can boot it, but its own
-        # boot program asks for the installation media and quits
-        for marker in ("Setup.exe", "BGIForInstalling.exe"):
-            if os.path.exists(os.path.join(path, marker)):
-                print(f"gal: {name} 是安装包，不是装好的游戏——引擎会启动，"
-                      f"但它的引导程序在找安装媒体", file=sys.stderr)
-                print("gal: 需要先安装出游戏数据，或直接指向安装后的目录", file=sys.stderr)
-                return 1
         # the BGI engine reads the game's files from its working directory
         return [binary] + info["extras"], path
     return [binary] + info["extras"], path
@@ -313,6 +305,15 @@ def cmd_launch(args):
     if not os.path.isdir(game["path"]):
         print(f"gal: 游戏目录不在了: {game['path']}", file=sys.stderr)
         return 1
+    # BGI trials ship as installers: the engine boots them and their own boot
+    # program then asks for the installation media and quits
+    if game["engine"] == "bgi":
+        for marker in ("Setup.exe", "BGIForInstalling.exe"):
+            if os.path.exists(os.path.join(game["path"], marker)):
+                print(f"gal: {args.game} 是安装包，不是装好的游戏", file=sys.stderr)
+                print("gal: 引擎能启动，但它的引导程序在找安装媒体；请指向安装后的目录",
+                      file=sys.stderr)
+                return 1
     argv, cwd = build_command(args.game, game, args.extra)
     # the KiriKiri port processes the framework's timer-driven execution in a loop,
     # so it is given one for as long as the window is up
