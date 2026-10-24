@@ -54,8 +54,8 @@ ENGINES = {
     },
     "kirikiri": {
         "label": "KiriKiri → Kirikiroid2",
-        "binary": f"{ENGINES_ROOT}/kirikiroid2-mac/build/tjsc",
-        "state": "partial",
+        "binary": f"{ENGINES_ROOT}/kirikiroid2-mac/build/krkrrun",
+        "state": "runnable",
         "signatures": [
             ("data.xp3", 10), ("patch.xp3", 8), ("startup.tjs", 8),
             ("*.xp3", 6), ("*.tjs", 3),
@@ -99,7 +99,7 @@ ENGINES = {
 
 # engines whose games run today, so `launch` can be honest about the rest
 RUNNABLE = {
-    "artemis","nscripter", "bgi"}
+    "artemis", "nscripter", "bgi", "kirikiri"}
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +251,20 @@ def build_command(name, game, extra):
     if game["engine"] == "nscripter":
         argv = [binary, "--root", path] + info["extras"]
         return argv, path
+    if game["engine"] == "kirikiri":
+        # KAG's project starts at startup.tjs in the game's own folder
+        entry = os.path.join(path, "startup.tjs")
+        if not os.path.exists(entry):
+            entry = None
+            for root, dirs, files in os.walk(path):
+                for f in sorted(files):
+                    if f == "startup.tjs":
+                        entry = os.path.join(root, f)
+                        break
+                if entry:
+                    break
+        argv = [binary] + ([entry] if entry else [])
+        return argv, path
     if game["engine"] == "artemis":
         # the player takes a script; the game's own are under root/script
         script = None
@@ -291,13 +305,20 @@ def cmd_launch(args):
         print(f"gal: 游戏目录不在了: {game['path']}", file=sys.stderr)
         return 1
     argv, cwd = build_command(args.game, game, args.extra)
+    # the KiriKiri port processes the framework's timer-driven execution in a loop,
+    # so it is given one for as long as the window is up
+    run_env = dict(os.environ)
+    if game["engine"] == "kirikiri":
+        run_env.setdefault("KRKR_LOOP_SECONDS", "600")
+    else:
+        run_env = None
     if args.dry_run:
         print(f"cwd:  {cwd}")
         print(f"argv: {' '.join(argv)}")
         return 0
     print(f"启动 {args.game} → {info['label']}")
     try:
-        return subprocess.call(argv, cwd=cwd)
+        return subprocess.call(argv, cwd=cwd, env=run_env if run_env else None)
     except KeyboardInterrupt:
         return 130
 
@@ -315,6 +336,13 @@ def cmd_verify(args):
         print(f"gal: {info.get('label', engine)} 还跑不了游戏", file=sys.stderr)
         return 1
     argv, cwd = build_command(args.game, game, [])
+    # the same environment a launch gets: the KiriKiri port needs its loop to be
+    # "still running" at all
+    run_env = dict(os.environ)
+    if game["engine"] == "kirikiri":
+        run_env.setdefault("KRKR_LOOP_SECONDS", "600")
+    else:
+        run_env = None
     if not os.path.exists(argv[0]) or not os.path.isdir(cwd):
         print("gal: 二进制或游戏目录不存在", file=sys.stderr)
         return 1
