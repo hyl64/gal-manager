@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 ENGINES_ROOT = os.path.expanduser("~/Documents/gal-engines")
 LIBRARY = os.path.expanduser("~/Library/Application Support/gal/library.json")
@@ -311,15 +312,19 @@ def cmd_verify(args):
     except OSError as e:
         print(f"gal: 启动失败: {e}", file=sys.stderr)
         return 1
+    started = time.monotonic()
     try:
         out, _ = proc.communicate(timeout=args.seconds)
         # the engine exiting on its own inside the window means it ran a script
-        # that ends, which is a pass too
+        # that ends, which is a pass too - unless it gave up straight away,
+        # which is what a missing data file looks like: the engine's own error
+        # box can be suppressed, so the quiet early exit is the only clue
         timed_out = False
     except subprocess.TimeoutExpired:
         proc.kill()
         out, _ = proc.communicate()
         timed_out = True
+    elapsed = time.monotonic() - started
     lines = [l for l in (out or "").splitlines() if l.strip()]
     errors = [l for l in lines if "error" in l.lower() or "can't open font" in l.lower()]
     if errors:
@@ -328,11 +333,17 @@ def cmd_verify(args):
             print(f"    {l.strip()}")
         print("  结论: 跑不起来")
         return 1
-    print(f"  {'✓ 进入主循环' if timed_out else '✓ 脚本正常结束'} ({len(lines)} 行输出)")
+    if timed_out:
+        verdict, ok = f"✓ 进入主循环（活过 {elapsed:.1f}s）", True
+    elif elapsed < 2.0:
+        verdict, ok = f"⚠ 启动后 {elapsed:.1f}s 就退出：多半缺数据或脚本出错被抑制", False
+    else:
+        verdict, ok = f"✓ 脚本正常结束（跑了 {elapsed:.1f}s）", True
+    print(f"  {verdict} ({len(lines)} 行输出)")
     for l in lines[:3]:
         print(f"    {l.strip()}")
-    print("  结论: 可以运行")
-    return 0
+    print(f"  结论: {'可以运行' if ok else '不算跑通'}")
+    return 0 if ok else 1
 
 
 def cmd_remove(args):

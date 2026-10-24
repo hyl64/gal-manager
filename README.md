@@ -61,6 +61,21 @@ The NScripter2 SDK samples are *not* in the list: they are written in
 NScripter 2's Lua dialect, which `verify` correctly reports as
 `Script error, Label "define" is not found`.
 
+## How verify judges
+
+`verify` starts the engine headless and reads both the output and the clock:
+
+| what happened | verdict |
+|---|---|
+| still running when the window closed | ✓ entered its main loop |
+| exited on its own after 2 s or more | ✓ the script ended normally |
+| exited on its own in under 2 s | ⚠ gave up: missing data or a suppressed error |
+
+The third row is the important one: the engines report errors through a
+message box, and a headless run has none, so a quiet early exit is the only
+evidence that something was missing.  The BGI trial below is exactly that case
+and `verify` refuses to call it a pass.
+
 ## Verified
 
 ```
