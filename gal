@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# gal - the one command for the galgame runtimes built in this tree
+#
+# Every engine here ships its own binary and its own idea of how to be
+# started: OnscripterYuri wants --root, OpenBGI wants the game directory as
+# the working directory, and the others are partly built.  This tool hides
+# that: it looks at a game folder, works out which engine the folder belongs
+# to, keeps the result in a library, and starts the right binary in the right
+# way.
+#
+#   gal engines              what is built and where
+#   gal add <dir>            add a game folder to the library
+#   gal list                 what is in the library
+#   gal info <game>          why the engine was recognised
+#   gal launch <game>        start it (--dry-run prints the command)
+#   gal remove <game>        drop it from the library
+#   gal doctor               check the binaries and the folders
+#
+# The library is a JSON file under ~/Library/Application Support/gal, so the
+# game folders stay where they are.
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+ENGINES_ROOT = os.path.expanduser("~/Documents/gal-engines")
+LIBRARY = os.path.expanduser("~/Library/Application Support/gal/library.json")
+
+# ---------------------------------------------------------------------------
+# the engines
+# ---------------------------------------------------------------------------
+#
+# Each entry says where its binary is, what a game folder of that engine looks
+# like, and how to start it.  "signatures" are (glob, weight) pairs: the
+# weight adds up and the engine with the most evidence wins, so a folder that
+# only shares one generic name is not mis-filed.
+
+ENGINES = {
+    "nscripter": {
+        "label": "NScripter → OnscripterYuri",
+        "binary": f"{ENGINES_ROOT}/OnscripterYuri/build/onsyuri",
+        "state": "ready",
+        "signatures": [
+            ("nscript.dat", 10), ("nscr_sec.dat", 10), ("00.txt", 8),
+            ("0.txt", 8), ("*.nsa", 6), ("*.ns2", 6), ("*.nt2", 6),
+            ("*.nt3", 6), ("*.dat", 2),
+        ],
+        "extras": ["--enc:sjis"],
+        "notes": "the script is usually Shift-JIS; --enc:gbk is for the Chinese ports",
+    },
+    "kirikiri": {
+        "label": "KiriKiri → Kirikiroid2",
+        "binary": f"{ENGINES_ROOT}/kirikiroid2-mac/build/tjsc",
+        "state": "partial",
+        "signatures": [
+            ("data.xp3", 10), ("patch.xp3", 8), ("startup.tjs", 8),
+            ("*.xp3", 6), ("*.tjs", 3),
+        ],
+        "extras": [],
+        "notes": "TJS2 and the XP3 layer run natively; the window is not there yet, "
+                 "so use `krkrpack list data.xp3` to see inside",
+    },
+    "reallive": {
+        "label": "RealLive → RLVM",
+        "binary": f"{ENGINES_ROOT}/rlvm/build/rlvm",
+        "state": "partial",
+        "signatures": [
+            ("Seen.txt", 10), ("Gameexe.ini", 10), ("*.g00", 8),
+            ("*.nwk", 6), ("*.koe", 6), ("*.ovk", 6),
+        ],
+        "extras": [],
+        "notes": "olde C++ that needs its own port; the other session owns it",
+    },
+    "bgi": {
+        "label": "Ethornell/BGI → OpenBGI",
+        "binary": f"{ENGINES_ROOT}/openbgi/openbgi-src/bin/bgi",
+        "state": "ready",
+        "signatures": [
+            ("system.arc", 10), ("sysprg.arc", 10), ("comap.dat", 8),
+            ("BGIError.txt", 8), ("BGI.dat", 6), ("*.arc", 2),
+        ],
+        "extras": [],
+        "notes": "the engine takes the game folder as its working directory",
+    },
+    "artemis": {
+        "label": "Artemis (no runtime yet)",
+        "binary": None,
+        "state": "missing",
+        "signatures": [("*.pfs", 10), ("*.ast", 8), ("*.iet", 8)],
+        "extras": [],
+        "notes": "nothing implements this engine yet; it is the from-scratch target",
+    },
+}
+
+# engines whose games run today, so `launch` can be honest about the rest
+RUNNABLE = {"nscripter", "bgi"}
+
+
+# ---------------------------------------------------------------------------
+# detection
+# ---------------------------------------------------------------------------
+
+def scan_folder(path):
+    """Return the engine and the evidence for a game folder."""
+    try:
+        names = os.listdir(path)
+    except OSError as e:
+        return None, [], [f"无法读取目录: {e}"]
+    lowered = [n.lower() for n in names]
+    scores = {}
+    evidence = {}
+    for engine, info in ENGINES.items():
+        score = 0
+        hits = []
+        for pattern, weight in info["signatures"]:
+            if pattern.startswith("*."):
+                suffix = pattern[1:]
+                matched = [n for n in lowered if n.endswith(suffix)]
+            else:
+                matched = [n for n in lowered if n == pattern.lower()]
+            if matched:
+                score += weight
+                hits.extend(sorted(matched)[:3])
+        if score:
+            scores[engine] = score
+            evidence[engine] = sorted(set(hits))
+    if not scores:
+        return None, [], []
+    best = max(scores, key=lambda e: scores[e])
+    return best, evidence[best], []
+
+
+# ---------------------------------------------------------------------------
+# the library
+# ---------------------------------------------------------------------------
+
+def load_library():
+    try:
+        with open(LIBRARY, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"games": {}}
+
+
+def save_library(lib):
+    os.makedirs(os.path.dirname(LIBRARY), exist_ok=True)
+    tmp = LIBRARY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(lib, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, LIBRARY)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_engines(args):
+    print(f"{'引擎':<10} {'状态':<8} 二进制")
+    for name, info in ENGINES.items():
+        binary = info["binary"]
+        if binary is None:
+            state = "缺引擎"
+        elif os.path.exists(binary):
+            state = "可运行" if info["state"] == "ready" else "部分"
+        else:
+            state = "未构建"
+        shown = binary.replace(ENGINES_ROOT, "~") if binary else "-"
+        print(f"{name:<10} {state:<8} {shown}")
+        print(f"{'':<10} {info['label']}")
+        print(f"{'':<10} {info['notes']}")
+    return 0
+
+
+def cmd_add(args):
+    path = os.path.abspath(os.path.expanduser(args.directory))
+    if not os.path.isdir(path):
+        print(f"gal: 不是目录: {path}", file=sys.stderr)
+        return 1
+    engine, evidence, problems = scan_folder(path)
+    if problems:
+        for p in problems:
+            print(f"gal: {p}", file=sys.stderr)
+        return 1
+    if engine is None:
+        print(f"gal: 认不出这个目录属于哪个引擎: {path}", file=sys.stderr)
+        print("gal: 已知特征见 `gal engines`", file=sys.stderr)
+        return 1
+    name = args.name or os.path.basename(path.rstrip("/"))
+    lib = load_library()
+    lib["games"][name] = {
+        "path": path,
+        "engine": engine,
+        "evidence": evidence,
+    }
+    save_library(lib)
+    info = ENGINES[engine]
+    print(f"已加入: {name}")
+    print(f"  引擎: {info['label']}")
+    print(f"  依据: {', '.join(evidence)}")
+    if info["state"] != "ready":
+        print(f"  注意: {info['notes']}")
+    return 0
+
+
+def cmd_list(args):
+    lib = load_library()
+    games = lib["games"]
+    if not games:
+        print("库里没有游戏。用 `gal add <目录>` 加一个。")
+        return 0
+    width = max(len(n) for n in games)
+    for name, g in sorted(games.items()):
+        engine = g["engine"]
+        label = ENGINES.get(engine, {}).get("label", engine)
+        mark = "✓" if engine in RUNNABLE else "·"
+        print(f"{mark} {name:<{width}}  {label}")
+        print(f"  {'':<{width}}  {g['path']}")
+    return 0
+
+
+def cmd_info(args):
+    lib = load_library()
+    game = lib["games"].get(args.game)
+    if game is None:
+        print(f"gal: 库里没有 {args.game}", file=sys.stderr)
+        return 1
+    engine = game["engine"]
+    info = ENGINES.get(engine, {})
+    print(f"游戏: {args.game}")
+    print(f"目录: {game['path']}")
+    print(f"引擎: {info.get('label', engine)}")
+    print(f"依据: {', '.join(game.get('evidence', []))}")
+    binary = info.get("binary")
+    print(f"二进制: {binary if binary else '(无)'}"
+          f"{'' if binary and os.path.exists(binary) else ' [不存在]'}")
+    print(f"说明: {info.get('notes', '')}")
+    return 0
+
+
+def build_command(name, game, extra):
+    """The binary, argv and working directory that start this game."""
+    info = ENGINES[game["engine"]]
+    binary = info["binary"]
+    path = game["path"]
+    if game["engine"] == "nscripter":
+        argv = [binary, "--root", path] + info["extras"]
+        return argv, path
+    if game["engine"] == "bgi":
+        # the BGI engine reads the game's files from its working directory
+        return [binary] + info["extras"], path
+    return [binary] + info["extras"], path
+
+
+def cmd_launch(args):
+    lib = load_library()
+    game = lib["games"].get(args.game)
+    if game is None:
+        print(f"gal: 库里没有 {args.game}", file=sys.stderr)
+        return 1
+    engine = game["engine"]
+    info = ENGINES.get(engine, {})
+    if engine not in RUNNABLE:
+        print(f"gal: {info.get('label', engine)} 还跑不了游戏", file=sys.stderr)
+        print(f"gal: {info.get('notes', '')}", file=sys.stderr)
+        return 1
+    binary = info["binary"]
+    if not os.path.exists(binary):
+        print(f"gal: 引擎二进制不存在: {binary}", file=sys.stderr)
+        print("gal: 先在对应引擎目录里构建（见各目录的 BUILD_NOTES.md）", file=sys.stderr)
+        return 1
+    if not os.path.isdir(game["path"]):
+        print(f"gal: 游戏目录不在了: {game['path']}", file=sys.stderr)
+        return 1
+    argv, cwd = build_command(args.game, game, args.extra)
+    if args.dry_run:
+        print(f"cwd:  {cwd}")
+        print(f"argv: {' '.join(argv)}")
+        return 0
+    print(f"启动 {args.game} → {info['label']}")
+    try:
+        return subprocess.call(argv, cwd=cwd)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_remove(args):
+    lib = load_library()
+    if args.game not in lib["games"]:
+        print(f"gal: 库里没有 {args.game}", file=sys.stderr)
+        return 1
+    del lib["games"][args.game]
+    save_library(lib)
+    print(f"已移除: {args.game}")
+    return 0
+
+
+def cmd_doctor(args):
+    ok = True
+    print("引擎二进制:")
+    for name, info in ENGINES.items():
+        binary = info["binary"]
+        if binary is None:
+            print(f"  · {name}: 还没有实现")
+            continue
+        exists = os.path.exists(binary)
+        ok = ok and exists
+        mark = "✓" if exists else "✗"
+        print(f"  {mark} {name}: {binary}")
+    print("\n自检:")
+    for tool in ("cmake", "brew"):
+        print(f"  {'✓' if shutil.which(tool) else '✗'} {tool}")
+    lib = load_library()
+    missing = [n for n, g in lib["games"].items() if not os.path.isdir(g["path"])]
+    for n in missing:
+        print(f"  ✗ {n}: 目录不在了 ({lib['games'][n]['path']})")
+        ok = False
+    if not missing:
+        print(f"  ✓ 库里的 {len(lib['games'])} 个游戏目录都在")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="gal", description="galgame 运行时管理器")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("engines", help="引擎状态").set_defaults(func=cmd_engines)
+
+    p = sub.add_parser("add", help="把一个游戏目录加进库")
+    p.add_argument("directory")
+    p.add_argument("--name", help="库里的名字（默认用目录名）")
+    p.set_defaults(func=cmd_add)
+
+    sub.add_parser("list", help="列出库").set_defaults(func=cmd_list)
+
+    p = sub.add_parser("info", help="一个游戏的检测详情")
+    p.add_argument("game")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("launch", help="启动游戏")
+    p.add_argument("game")
+    p.add_argument("--dry-run", action="store_true", help="只打印命令，不启动")
+    p.add_argument("extra", nargs="*", help="传给引擎的额外参数")
+    p.set_defaults(func=cmd_launch)
+
+    p = sub.add_parser("remove", help="从库里移除")
+    p.add_argument("game")
+    p.set_defaults(func=cmd_remove)
+
+    sub.add_parser("doctor", help="自检").set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
