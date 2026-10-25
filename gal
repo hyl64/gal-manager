@@ -330,8 +330,18 @@ def cmd_launch(args):
     else:
         run_env = None
     if getattr(args, "dump", None):
-        # the BGI engine can write the surface it draws without a window; that is
-        # how a title can be looked at on a machine with no screen
+        out = os.path.abspath(args.dump)
+        # the KiriKiri port takes --screenshot and the BGI engine writes the surface
+        # it draws; either way a title can be looked at with no screen
+        if engine == "kirikiri":
+            env = dict(os.environ)
+            env.setdefault("SDL_VIDEODRIVER", "dummy")
+            env.setdefault("KRKR_LOOP_SECONDS", "3")
+            rc = subprocess.call(argv + ["--screenshot", out], cwd=cwd, env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok = os.path.exists(out) and os.path.getsize(out) > 1024
+            print(f"gal: {'已导出' if ok else '没有导出'} {out}")
+            return 0 if ok else 1
         if engine != "bgi":
             print(f"gal: {engine} 不支持无头导出画面", file=sys.stderr)
             return 1
