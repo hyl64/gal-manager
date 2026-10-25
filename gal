@@ -10,11 +10,17 @@
 #
 #   gal engines              what is built and where
 #   gal add <dir>            add a game folder to the library
+#                            (auto-prep for NScripter, --no-prep to skip)
+#   gal prep <game|path>     transcode .avi/.mpg/.mpeg -> _video/*.mp4 +
+#                            video_map.json (--report json for the machine view)
 #   gal list                 what is in the library
 #   gal info <game>          why the engine was recognised
 #   gal launch <game>        start it (--dry-run prints the command)
 #   gal remove <game>        drop it from the library
 #   gal doctor               check the binaries and the folders
+#   gal savetest <game>      save/load round-trip via harness/run_savetest.sh
+#                            (the harness lands with task-3; until then it says
+#                            "待接入")
 #
 # The library is a JSON file under ~/Library/Application Support/gal, so the
 # game folders stay where they are.
@@ -26,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 
 ENGINES_ROOT = os.path.expanduser("~/Documents/gal-engines")
 LIBRARY = os.path.expanduser("~/Library/Application Support/gal/library.json")
@@ -160,6 +167,502 @@ def save_library(lib):
 
 
 # ---------------------------------------------------------------------------
+# video preprocessing  (gal prep)
+# ---------------------------------------------------------------------------
+#
+# NScripter-era games ship their movies as .avi/.mpg/.mpeg, which the Mac
+# ports cannot play (no smpeg, no avifile, and Homebrew deprecated both).
+# `gal prep` transcodes them once, ahead of time, into H.264 MP4s under
+# <game>/_video/, and writes <game>/_video/video_map.json so the engine can
+# look up "the file the script names" -> "the file that actually plays".
+# The map format is fixed by gal-engines/DESIGN-VIDEO.md (version 1); do not
+# improvise fields here.
+#
+# Pipeline per file:
+#   ffprobe -> codec/SAR/DAR/fps/field order/audio/duration
+#   ffmpeg  -> yadif (if the source is interlaced) + scale to the display
+#              size with square pixels + h264_videotoolbox (hardware);
+#   on failure retry the same chain with libx264 -preset veryfast.
+# Idempotent: if the .mp4 already exists and is newer than the source, and
+# ffprobe still reads it, the file is skipped and only (re-)registered.
+#
+# GAL_FFMPEG_BIN / GAL_FFPROBE_BIN override the tool paths (used by the
+# self-test to inject a failing-encoder shim); GAL_PREP_SOFT_ONLY=1 skips the
+# hardware attempt; GAL_PREP_FFMPEG_TIMEOUT overrides the per-file timeout.
+
+VIDEO_EXTS = (".avi", ".mpg", ".mpeg")
+VIDEO_OUT_DIR = "_video"
+VIDEO_MAP_NAME = "video_map.json"
+VIDEO_MAP_VERSION = 1
+PROBE_TIMEOUT = 30
+FFMPEG_TIMEOUT = 900
+
+
+class ProbeError(Exception):
+    pass
+
+
+def ffmpeg_bin():
+    return os.environ.get("GAL_FFMPEG_BIN") or shutil.which("ffmpeg")
+
+
+def ffprobe_bin():
+    return os.environ.get("GAL_FFPROBE_BIN") or shutil.which("ffprobe")
+
+
+def _parse_ratio(text):
+    """'16:11' or '30000/1001' -> (num, den); anything unusable -> None."""
+    if not text:
+        return None
+    for sep in (":", "/"):
+        if sep in text:
+            a, _, b = text.partition(sep)
+            try:
+                n, d = int(a), int(b)
+            except ValueError:
+                return None
+            if d <= 0 or n <= 0:
+                return None
+            return n, d
+    return None
+
+
+def _round_even(x, minimum=2):
+    v = int(round(x))
+    if v % 2:
+        v -= 1
+    return max(minimum, v)
+
+
+def human_bytes(n):
+    if n is None:
+        return "-"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+
+
+def human_dur(sec):
+    if sec is None:
+        return "-"
+    return f"{sec:.1f}s"
+
+
+def probe_media(path):
+    """ffprobe a file; return the fields the pipeline needs, or raise."""
+    exe = ffprobe_bin()
+    if not exe:
+        raise ProbeError("ffprobe 不存在（brew install ffmpeg）")
+    argv = [exe, "-v", "error", "-print_format", "json",
+            "-show_streams", "-show_format", path]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace", timeout=PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ProbeError(f"ffprobe 启动失败: {e}")
+    if proc.returncode != 0:
+        raise ProbeError((proc.stderr or "").strip().splitlines()[-1]
+                         if proc.stderr else "ffprobe 非零退出")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError as e:
+        raise ProbeError(f"ffprobe 输出不是 JSON: {e}")
+    streams = data.get("streams") or []
+    v = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if v is None:
+        raise ProbeError("没有视频流")
+    a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    fmt = data.get("format") or {}
+
+    def first_float(*vals):
+        for v_ in vals:
+            try:
+                f = float(v_)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return None
+
+    duration = first_float(fmt.get("duration"), v.get("duration"),
+                           a.get("duration") if a else None)
+    fps = _parse_ratio(v.get("avg_frame_rate")) or _parse_ratio(v.get("r_frame_rate"))
+    return {
+        "codec": v.get("codec_name"),
+        "width": v.get("width"),
+        "height": v.get("height"),
+        "sar": v.get("sample_aspect_ratio") or "1:1",
+        "dar": v.get("display_aspect_ratio"),
+        "fps": (fps[0] / fps[1]) if fps else None,
+        "field_order": v.get("field_order") or "unknown",
+        "has_audio": a is not None,
+        "audio_codec": a.get("codec_name") if a else None,
+        "duration": duration,
+    }
+
+
+def target_size(info):
+    """Display size in square pixels, rounded to even, from coded size + SAR."""
+    w, h = info.get("width"), info.get("height")
+    if not w or not h:
+        raise ProbeError("ffprobe 没有给出分辨率")
+    sar = _parse_ratio(info.get("sar")) or (1, 1)
+    return _round_even(w * sar[0] / sar[1]), _round_even(h)
+
+
+def build_vf(info):
+    parts = []
+    if info.get("field_order") not in (None, "progressive", "unknown"):
+        parts.append("yadif=0:-1:0")
+    tw, th = target_size(info)
+    if (tw, th) != (info["width"], info["height"]):
+        parts.append(f"scale={tw}:{th}")
+    parts.append("setsar=1")
+    return ",".join(parts), (tw, th)
+
+
+def pick_bitrate(width, height, fps):
+    """~0.08 bits per pixel per frame for the hardware pass, clamped."""
+    bps = int(width * height * (fps or 25) * 0.08)
+    return f"{max(500_000, min(bps, 10_000_000))}"
+
+
+def ffmpeg_argv(src, dst, info, encoder, vf, size):
+    argv = [ffmpeg_bin(), "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", src, "-map", "0:v:0"]
+    if info["has_audio"]:
+        argv += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"]
+    else:
+        argv += ["-an"]
+    argv += ["-vf", vf]
+    tw, th = size
+    if encoder == "h264_videotoolbox":
+        argv += ["-c:v", encoder,
+                 "-realtime", "0",
+                 "-b:v", pick_bitrate(tw, th, info["fps"]),
+                 "-profile:v", "high"]
+    else:
+        argv += ["-c:v", encoder, "-preset", "veryfast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-profile:v", "high"]
+    argv += ["-movflags", "+faststart", dst]
+    return argv
+
+
+def run_one_attempt(src, dst, info, encoder, vf, size):
+    """One ffmpeg pass; True on success, (False, error_tail) otherwise."""
+    tmp = dst + ".part.mp4"
+    argv = ffmpeg_argv(src, tmp, info, encoder, vf, size)
+    timeout = float(os.environ.get("GAL_PREP_FFMPEG_TIMEOUT", FFMPEG_TIMEOUT))
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace", timeout=timeout)
+        rc, err = proc.returncode, proc.stderr
+    except subprocess.TimeoutExpired:
+        _quiet_unlink(tmp)
+        return False, f"ffmpeg 超时（>{timeout:.0f}s）", 0.0
+    except OSError as e:
+        _quiet_unlink(tmp)
+        return False, f"ffmpeg 启动失败: {e}", 0.0
+    elapsed = time.monotonic() - started
+    if rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+        os.replace(tmp, dst)
+        return True, "", elapsed
+    _quiet_unlink(tmp)
+    tail = (err or "").strip().splitlines()[-3:]
+    return False, " | ".join(tail) or f"ffmpeg 退出码 {rc}", elapsed
+
+
+def _quiet_unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def transcode_one(src, dst, info):
+    """Hardware attempt, then the libx264 retry.  Returns a record dict."""
+    vf, size = build_vf(info)
+    attempts = []
+    chain = []
+    if os.environ.get("GAL_PREP_SOFT_ONLY") != "1":
+        chain.append("h264_videotoolbox")
+    chain.append("libx264")
+    record = {"status": "failed", "encoder": None, "elapsed_sec": None,
+              "attempts": attempts, "error": None, "filter": vf,
+              "target": f"{size[0]}x{size[1]}"}
+    total = 0.0
+    for enc in chain:
+        ok, err, el = run_one_attempt(src, dst, info, enc, vf, size)
+        total += el
+        attempts.append({"encoder": enc, "ok": ok, "error": err or None,
+                         "elapsed_sec": round(el, 2)})
+        if ok:
+            record.update(status="transcoded", encoder=enc,
+                          elapsed_sec=round(el, 2))
+            return record
+        record["error"] = err
+    record["elapsed_sec"] = round(total, 2)
+    return record
+
+
+def should_skip(src, dst):
+    """Idempotence: newer non-empty target that ffprobe still reads."""
+    try:
+        if not (os.path.exists(dst) and os.path.getsize(dst) > 0):
+            return False
+        if os.path.getmtime(dst) < os.path.getmtime(src):
+            return False
+    except OSError:
+        return False
+    try:
+        probe_media(dst)
+    except ProbeError:
+        return False
+    return True
+
+
+def find_videos(game_root):
+    """Loose *.avi/.mpg/.mpeg under the game root, case-insensitive.
+
+    Returns (disk_rel, map_from) pairs, sorted by map_from.  disk_rel is the
+    path as it exists on disk; map_from is the contract spelling - relative
+    to the game root, '/' separators, '\\' folded to '/' (NScripter scripts
+    use either).  _video/ (our own output) and dot-directories are skipped."""
+    out = []
+    for root, dirs, files in os.walk(game_root):
+        dirs[:] = [d for d in sorted(dirs)
+                   if not d.startswith(".")
+                   and os.path.join(root, d) != os.path.join(game_root, VIDEO_OUT_DIR)]
+        for f in files:
+            if f.lower().endswith(VIDEO_EXTS):
+                disk = os.path.relpath(os.path.join(root, f), game_root)
+                norm = disk.replace(os.sep, "/").replace("\\", "/")
+                out.append((disk, norm))
+    return sorted(out, key=lambda p: p[1])
+
+
+def out_name_for(rel, used):
+    """_video/<original name>.mp4; on a basename collision the flattened
+    relative path is used so two nested movies never share one output.
+
+    `rel` is the map spelling ('/' separators, '\\' folded to '/').  A file
+    whose real name contains a backslash therefore gets an output name with
+    '_' there instead: the map's `from` stays T1-normalised (T1 treats '\\'
+    and '/' as equal), and no output path ever carries a stray backslash."""
+    base = os.path.splitext(os.path.basename(rel))[0] + ".mp4"
+    base = base.replace("\\", "_")
+    if base not in used:
+        used.add(base)
+        return base
+    flat = rel.replace("/", "_").replace("\\", "_")
+    base = os.path.splitext(flat)[0] + ".mp4"
+    used.add(base)
+    return base
+
+
+def load_video_map(map_path):
+    """Existing mappings; unreadable or malformed maps are rebuilt from
+    scratch (T1 ignores bad entries anyway, and we own this file)."""
+    try:
+        with open(map_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == VIDEO_MAP_VERSION:
+            entries = data.get("mappings")
+            if isinstance(entries, list):
+                return [e for e in entries if isinstance(e, dict)
+                        and e.get("from") and e.get("to")]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def write_video_map(map_path, entries):
+    """Atomic write, format exactly per DESIGN-VIDEO.md (version 1)."""
+    doc = {"version": VIDEO_MAP_VERSION,
+           "mappings": [{"from": e["from"], "to": e["to"],
+                         "codec": e.get("codec", "h264"),
+                         "source": e.get("source", "loose")}
+                        for e in sorted(entries, key=lambda x: x["from"])]}
+    tmp = map_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, map_path)
+    return doc
+
+
+def _hide_root(text, game_path):
+    """Error text goes into the report and the terminal; keep the game's own
+    absolute path out of it - the relative name says enough."""
+    return text.replace(game_path + "/", "").replace(game_path, ".")
+
+
+def do_prep(game_path, game_name=None, quiet=False):
+    """Run the whole preprocessing pass over one game folder.
+
+    Returns (report, exit_code); the report is the --report json document.
+    Never touches anything outside <game>/_video/."""
+    game_path = os.path.abspath(game_path)
+    report = {"game": game_name or os.path.basename(game_path),
+              "root": game_path,
+              "map": f"{VIDEO_OUT_DIR}/{VIDEO_MAP_NAME}",
+              "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "tools": {"ffmpeg": ffmpeg_bin(), "ffprobe": ffprobe_bin()},
+              "videos": [], "counts": {}}
+    if not os.path.isdir(game_path):
+        report["error"] = f"不是目录: {game_path}"
+        return report, 1
+    if not ffmpeg_bin() or not ffprobe_bin():
+        report["error"] = "ffmpeg/ffprobe 不存在（brew install ffmpeg）"
+        return report, 1
+
+    out_dir = os.path.join(game_path, VIDEO_OUT_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    map_path = os.path.join(out_dir, VIDEO_MAP_NAME)
+
+    rels = find_videos(game_path)
+    map_names = {m for _, m in rels}
+    prev = {e["from"]: e for e in load_video_map(map_path)}
+    # names already committed stay reserved, so a re-run never renames output
+    used = {os.path.basename(e["to"]) for e in prev.values()}
+    # entries another producer wrote (source nsa:<archive>#<entry>) survive;
+    # loose entries are recomputed from the folder below
+    merged = {k: v for k, v in prev.items()
+              if not str(v.get("source", "loose")).startswith("loose")
+              and k not in map_names}
+
+    def assign_name(map_rel):
+        """Reuse the committed name when the mapping still exists; the
+        flattened rel keeps nested collisions from sharing one output."""
+        committed = prev.get(map_rel)
+        if committed:
+            name = os.path.basename(committed["to"]).replace("\\", "_")
+            used.add(name)
+            return name
+        return out_name_for(map_rel, used)
+
+    for disk_rel, map_rel in rels:
+        src = os.path.join(game_path, disk_rel)
+        dst_name = assign_name(map_rel)
+        dst = os.path.join(out_dir, dst_name)
+        entry = {"file": map_rel, "to": f"{VIDEO_OUT_DIR}/{dst_name}",
+                 "source_codec": None,
+                 "source_size": None, "sar": None, "dar": None,
+                 "fps": None, "duration_sec": None, "status": None,
+                 "encoder": None, "elapsed_sec": None, "output_bytes": None,
+                 "error": None}
+        if disk_rel != map_rel:
+            entry["disk_file"] = disk_rel
+        try:
+            info = probe_media(src)
+        except ProbeError as e:
+            # the source cannot be decoded here; if an earlier run left a good
+            # transcode behind, keep its mapping - the engine can still play it
+            committed = prev.get(map_rel)
+            if committed and committed.get("to") == entry["to"] and should_skip(src, dst):
+                merged[map_rel] = {"from": map_rel, "to": entry["to"],
+                                   "codec": "h264", "source": "loose"}
+                entry["output_bytes"] = os.path.getsize(dst)
+            entry.update(status="unprobeable", error=_hide_root(str(e), game_path))
+            report["videos"].append(entry)
+            continue
+        entry.update(source_codec=info["codec"],
+                     source_size=f"{info['width']}x{info['height']}",
+                     sar=info["sar"], dar=info["dar"], fps=info["fps"],
+                     duration_sec=info["duration"])
+        if should_skip(src, dst):
+            entry["status"] = "skipped"
+        else:
+            rec = transcode_one(src, dst, info)
+            entry.update(status=rec["status"], encoder=rec["encoder"],
+                         elapsed_sec=rec["elapsed_sec"], attempts=rec["attempts"],
+                         filter=rec["filter"], target_size=rec["target"])
+            if rec["status"] != "transcoded":
+                entry["error"] = _hide_root(rec["error"] or "", game_path)
+                for a in entry["attempts"]:
+                    if a.get("error"):
+                        a["error"] = _hide_root(a["error"], game_path)
+        if entry["status"] in ("transcoded", "skipped"):
+            try:
+                entry["output_bytes"] = os.path.getsize(dst)
+            except OSError:
+                entry["output_bytes"] = None
+            merged[map_rel] = {"from": map_rel, "to": entry["to"],
+                           "codec": "h264", "source": "loose"}
+        report["videos"].append(entry)
+
+    map_doc = write_video_map(map_path, list(merged.values()))
+    counts = {"found": len(rels), "transcoded": 0, "skipped": 0,
+              "failed": 0, "unprobeable": 0, "mapped": len(map_doc["mappings"])}
+    for v in report["videos"]:
+        if v["status"] == "transcoded":
+            counts["transcoded"] += 1
+        elif v["status"] == "skipped":
+            counts["skipped"] += 1
+        elif v["status"] == "unprobeable":
+            counts["unprobeable"] += 1
+        else:
+            counts["failed"] += 1
+    report["counts"] = counts
+    rc = 0 if counts["failed"] == 0 and counts["unprobeable"] == 0 else 1
+    if not quiet:
+        print_prep_table(report)
+    return report, rc
+
+
+def _dwidth(s):
+    """Display width in columns (CJK labels count as two)."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in s)
+
+
+def _pad(s, w):
+    return s + " " * max(0, w - _dwidth(s))
+
+
+def print_prep_table(report):
+    rows = [("文件", "源", "分辨率", "时长", "状态", "编码器", "耗时", "产物")]
+    for v in report["videos"]:
+        rows.append((
+            v["file"],
+            v["source_codec"] or "-",
+            f"{v['source_size']}→{v.get('target_size', '')}" if v.get("target_size")
+            else (v["source_size"] or "-"),
+            human_dur(v["duration_sec"]),
+            {"transcoded": "转码", "skipped": "跳过(幂等)", "failed": "失败",
+             "unprobeable": "不可解码"}.get(v["status"], v["status"] or "-"),
+            v["encoder"] or "-",
+            f"{v['elapsed_sec']:.1f}s" if v["elapsed_sec"] else "-",
+            human_bytes(v["output_bytes"]),
+        ))
+    widths = [max(_dwidth(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for n, r in enumerate(rows):
+        print("  ".join(_pad(c, widths[i]) for i, c in enumerate(r)).rstrip())
+        if n == 0:
+            print("  ".join("-" * w for w in widths))
+    c = report["counts"]
+    print(f"共 {c['found']} 个影片：转码 {c['transcoded']}，跳过 {c['skipped']}，"
+          f"失败 {c['failed']}，映射 {c['mapped']} 条 -> {report['map']}")
+    for v in report["videos"]:
+        if v["status"] in ("failed", "unprobeable") and v.get("error"):
+            print(f"  ! {v['file']}: {v['error'][:160]}")
+
+
+def resolve_game_dir(name_or_path):
+    """A library name or a direct folder; returns (name, abspath) or None."""
+    lib = load_library()
+    if name_or_path in lib["games"]:
+        return name_or_path, lib["games"][name_or_path]["path"]
+    path = os.path.abspath(os.path.expanduser(name_or_path))
+    if os.path.isdir(path):
+        return os.path.basename(path.rstrip("/")), path
+    return None
+
+
+# ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
@@ -178,6 +681,48 @@ def cmd_engines(args):
         print(f"{'':<10} {info['label']}")
         print(f"{'':<10} {info['notes']}")
     return 0
+
+
+def cmd_prep(args):
+    hit = resolve_game_dir(args.game)
+    if hit is None:
+        print(f"gal: 库里没有 {args.game}，也不是一个目录: {args.game}",
+              file=sys.stderr)
+        return 1
+    name, path = hit
+    report, rc = do_prep(path, name, quiet=args.report == "json")
+    if args.report == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif report.get("error"):
+        print(f"gal: {report['error']}", file=sys.stderr)
+    return rc
+
+
+def cmd_savetest(args):
+    """Thin forwarder to the task-3 harness (harness/run_savetest.sh).
+
+    Extension point for T3: the harness owns everything under harness/; gal
+    only resolves the game folder and runs
+        harness/run_savetest.sh <game_root>
+    and passes -- through.  Until the script exists this reports 待接入."""
+    hit = resolve_game_dir(args.game)
+    if hit is None:
+        print(f"gal: 库里没有 {args.game}，也不是一个目录: {args.game}",
+              file=sys.stderr)
+        return 1
+    name, path = hit
+    script = os.environ.get("GAL_SAVETEST_SH") or \
+        os.path.join(ENGINES_ROOT, "harness", "run_savetest.sh")
+    if not os.path.exists(script):
+        print(f"gal: savetest 待接入 — harness/run_savetest.sh 不存在 ({script})")
+        print("gal: 该脚本由 task-3 提供；到位后本命令直接转发 <游戏目录> 给它")
+        return 2
+    argv = [script, path] + list(args.rest or [])
+    try:
+        return subprocess.call(argv, cwd=ENGINES_ROOT)
+    except OSError as e:
+        print(f"gal: 无法启动 {script}: {e}", file=sys.stderr)
+        return 1
 
 
 def cmd_add(args):
@@ -223,6 +768,18 @@ def cmd_add(args):
     print(f"  依据: {', '.join(evidence)}")
     if info["state"] != "ready":
         print(f"  注意: {info['notes']}")
+    # preprocessing: only NScripter auto-preps in the first version; the same
+    # do_prep() is the shared mechanism for the later engines, just not
+    # wired to fire here yet.
+    if engine == "nscripter" and not args.no_prep:
+        print("  预处理: 扫描 .avi/.mpg/.mpeg 并转码到 _video/（--no-prep 跳过）")
+        report, rc = do_prep(path, name, quiet=False)
+        if rc != 0 and not report.get("error"):
+            print("  预处理有未成功项（不影响入库），可单独跑 gal prep "
+                  f"{name} 重转")
+    elif engine == "nscripter":
+        print("  预处理: 已跳过（--no-prep），需要时跑 gal prep "
+              f"{name}")
     return 0
 
 
@@ -500,8 +1057,10 @@ def cmd_doctor(args):
         mark = "✓" if exists else "✗"
         print(f"  {mark} {name}: {binary}")
     print("\n自检:")
-    for tool in ("cmake", "brew"):
-        print(f"  {'✓' if shutil.which(tool) else '✗'} {tool}")
+    for tool in ("cmake", "brew", "ffmpeg", "ffprobe"):
+        print(f"  {'✓' if shutil.which(tool) else '✗'} {tool}"
+              + ("" if tool not in ("ffmpeg", "ffprobe")
+                 else "   (gal prep 需要)"))
     lib = load_library()
     missing = [n for n, g in lib["games"].items() if not os.path.isdir(g["path"])]
     for n in missing:
@@ -523,7 +1082,20 @@ def main(argv):
     p = sub.add_parser("add", help="把一个游戏目录加进库")
     p.add_argument("directory")
     p.add_argument("--name", help="库里的名字（默认用目录名）")
+    p.add_argument("--no-prep", action="store_true",
+                   help="识别引擎后不自动做影片预处理（目前只对 NScripter 生效）")
     p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("prep", help="把游戏里的 .avi/.mpg/.mpeg 预转码到 _video/ 并写 video_map.json")
+    p.add_argument("game", metavar="game|path", help="库里的名字或游戏目录")
+    p.add_argument("--report", choices=["table", "json"], default="table",
+                   help="table（默认，给人看）或 json（机器可读，含源codec/分辨率/时长/耗时/产物大小）")
+    p.set_defaults(func=cmd_prep)
+
+    p = sub.add_parser("savetest", help="存读档往返测试（转发 harness/run_savetest.sh，由 task-3 提供）")
+    p.add_argument("game", metavar="game|path")
+    p.add_argument("rest", nargs="*", help="-- 之后的参数原样转发给 harness")
+    p.set_defaults(func=cmd_savetest)
 
     sub.add_parser("list", help="列出库").set_defaults(func=cmd_list)
 
