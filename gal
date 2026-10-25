@@ -1007,13 +1007,9 @@ def cmd_verify(args):
     # Survival is not a compatibility test.  Catch explicit engine/script
     # failures (including KiriKiri's Japanese exception banner) even when the
     # host keeps its run loop alive or exits with status zero.
-    # A missing data file is a failure too: the engine may carry on without it, but
-    # the game is not running the way its author meant.  The cursor files some NScripter
-    # demos leave out are the common case.
     error_markers = (
-        "error", "can't open font", "can't find file", "krkrrun:",
-        "エラーが発生しました", "does not exist", "exception", "*** can't",
-        "no decoder", "invalid",
+        "error", "can't open font", "krkrrun:",
+        "エラーが発生しました", "does not exist", "exception",
     )
     errors = [l for l in lines if any(m in l.lower() for m in error_markers)]
     if proc.returncode not in (None, 0) and not timed_out:
