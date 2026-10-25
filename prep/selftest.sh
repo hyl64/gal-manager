@@ -133,9 +133,20 @@ ffmpeg -loglevel error -y -f lavfi -i "testsrc=size=160x120:rate=25:duration=1" 
 "$GAL" add "$BASE/krk" --name selftest-krk >/dev/null 2>&1
 check "KiriKiri 不自动 prep" test ! -d "$BASE/krk/_video"
 
-echo "== 10) savetest 骨架：脚本缺失报待接入(2)，存在则转发"
-out=$("$GAL" savetest selftest-game 2>&1); [ $? -eq 2 ] && echo "$out" | grep -q "待接入" \
-  && pass "缺 harness 时返回 2 并报待接入" || { fail "savetest 缺省行为不对"; echo "$out"; }
+echo "== 10) savetest：harness 存在则转发，缺失才报待接入(2)"
+# the real harness now lives in ../harness/run_savetest.sh, so the default path
+# forwards; point it at a missing script to exercise the "待接入" branch.
+out=$(GAL_SAVETEST_SH=/nonexistent/run_savetest.sh "$GAL" savetest selftest-game 2>&1)
+rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "待接入" \
+  && pass "缺 harness 时返回 2 并报待接入" || { fail "savetest 缺失分支不对 (rc=$rc)"; echo "$out"; }
+if [ -x "$HERE/../harness/run_savetest.sh" ]; then
+  out=$(GAL_SAVETEST_SH="$HERE/../harness/run_savetest.sh" GAL_ENGINE=/bin/true \
+        "$GAL" savetest selftest-game 2>&1)
+  rc=$?
+  [ $rc -eq 2 ] && pass "harness 存在时被转发（/bin/true 不是引擎，故报环境缺失 2）" \
+    || { fail "savetest 转发分支不对 (rc=$rc)"; echo "$out"; }
+fi
 printf '#!/bin/sh\necho "SAVETEST-GOT $*"\n' > "$BASE/fake-savetest.sh"; chmod +x "$BASE/fake-savetest.sh"
 out=$(GAL_SAVETEST_SH="$BASE/fake-savetest.sh" "$GAL" savetest selftest-game -- --extra 2>&1)
 echo "$out" | grep -q "SAVETEST-GOT $BASE/game" && echo "$out" | grep -q -- "--extra" \
@@ -163,21 +174,66 @@ import importlib.machinery, importlib.util, sys
 loader = importlib.machinery.SourceFileLoader("galmod", sys.argv[1])
 m = importlib.util.module_from_spec(importlib.util.spec_from_loader("galmod", loader))
 loader.exec_module(m)
-assert m.VERIFY_WARN_MARKERS == (), "warn 集应为空占位，等 T3 语料"
-m.VERIFY_WARN_MARKERS = ("*** can't find file", "no decoder")   # 注入候选
-lines = [" *** can't find file [cursor0.bmp] ***", "no decoder for af.mpg",
+import re
+# the whitelist is no longer a blank placeholder: it must cover the optional
+# resources OnscripterYuri skips, and must NOT contain the over-broad words
+# that made 228eb58 mis-kill the official demos.
+assert m.VERIFY_WARN_MARKERS, "warn 集不应再为空"
+assert m.VERIFY_WARN_PATTERNS, "warn 正则集不应为空"
+for banned in ("invalid", "no decoder", "can't find file"):
+    assert banned not in m.VERIFY_WARN_MARKERS, f"过宽的词不该进白名单: {banned}"
+    assert banned not in m.VERIFY_ERROR_MARKERS, f"过宽的词不该进 error: {banned}"
+warn_res = [re.compile(p, re.I) for p in m.VERIFY_WARN_PATTERNS]
+lines = [" *** can't find file [cursor0.bmp] ***",
+         " *** can't find file [uoncur.bmp] ***",
+         " *** can't find file [doffcur.bmp] ***",
+         "cannot open system.lua",
          "some error here", "plain output"]
 low = [(l, l.lower()) for l in lines]
 err = [l for l, k in low if any(x in k for x in m.VERIFY_ERROR_MARKERS)]
-warn = [l for l, k in low if any(x in k for x in m.VERIFY_WARN_MARKERS)
+warn = [l for l, k in low
+        if (any(x in k for x in m.VERIFY_WARN_MARKERS)
+            or any(r.search(k) for r in warn_res))
         and not any(x in k for x in m.VERIFY_ERROR_MARKERS)]
-assert err == ["some error here"] and len(warn) == 2, (err, warn)
+assert err == ["some error here"], err
+assert len(warn) == 4, warn       # 3 cursor lines + system.lua
+# and a genuinely required file must still fail the run
+req = [" *** can't find file [scenario.dat] ***"]
+assert not any(any(r.search(x.lower()) for r in warn_res) for x in req), \
+    "必需文件缺失不该被白名单吞掉"
 PY
 [ $? -eq 0 ] && pass "分级互斥正确，VERIFY_*_MARKERS 即接入点" || fail "分级管道不对"
+
+echo "== 14) nsa 归档内视频：解出 -> 转码 -> source=nsa: 映射"
+N="$BASE/nsa"; mkdir -p "$N"
+ffmpeg -loglevel error -y -f lavfi -i "testsrc=size=320x240:rate=25:duration=1" \
+  -c:v mpeg4 -q:v 5 "$BASE/inside.avi"
+printf 'stub' > "$N/nscript.dat"
+python3 - "$BASE/inside.avi" "$N/arc.nsa" <<'PY'
+import struct, sys
+payload = open(sys.argv[1], 'rb').read()
+name = b'opening.avi\x00'
+entry = len(name) + 1 + 4 + 4 + 4
+base = 6 + entry
+hdr = struct.pack('>H I', 1, base)
+hdr += name + struct.pack('>B I I I', 0, 0, len(payload), len(payload))
+open(sys.argv[2], 'wb').write(hdr + payload)
+PY
+"$GAL" add "$N" --name selftest-nsa >/dev/null 2>&1
+check "归档内视频被转码" test "$(ls "$N/_video"/*.mp4 2>/dev/null | wc -l | tr -d ' ')" -eq 1
+check "映射 source 用 nsa: 形态" python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+m=d["mappings"][0]
+assert m["source"].startswith("nsa:arc.nsa#"), m["source"]
+assert m["from"]=="opening.avi", m["from"]
+' "$N/_video/video_map.json"
+check "计数把归档条目算进 found" bash -c '"$1" prep "$2" | grep -q "共 1 个影片"' _ "$GAL" "$N"
 
 "$GAL" remove selftest-game >/dev/null 2>&1
 "$GAL" remove selftest-nop  >/dev/null 2>&1
 "$GAL" remove selftest-krk  >/dev/null 2>&1
+"$GAL" remove selftest-nsa  >/dev/null 2>&1
 [ "${KEEP:-}" = "1" ] || rm -rf "$BASE"
 echo
 echo "selftest: $pass_n pass, $fail_n fail"

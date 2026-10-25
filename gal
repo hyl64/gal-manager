@@ -28,6 +28,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -220,7 +221,24 @@ VERIFY_ERROR_MARKERS = (
     "error", "can't open font", "krkrrun:",
     "エラーが発生しました", "does not exist", "exception",
 )
-VERIFY_WARN_MARKERS = ()
+
+# Optional resources OnscripterYuri skips on purpose (BUILD_NOTES calls them
+# "harmless warning, the engine skips it").  Missing them must never fail a
+# run -- that is exactly what 228eb58 got wrong.  Two kinds of entry:
+#   WARN_MARKERS  plain substrings, for messages that are noise verbatim
+#   WARN_PATTERNS regexes, for families whose filenames vary per game
+# Note what is NOT here: "invalid" and "no decoder" stay out deliberately.
+# They are far too broad (they match normal ffprobe/decoder chatter) and were
+# part of the same bad commit.
+VERIFY_WARN_MARKERS = (
+    "cannot open system.lua",
+    "plugin  - not available",          # soundpressplgin, plugin-free builds
+)
+VERIFY_WARN_PATTERNS = (
+    r"can't find file \[(u|d)?(on|off)?cur(sor)?\d*\.bmp\]",  # cursors
+    r"can't find file \[system\.lua\]",
+    r"can't find file \[(doffcur|uoncur|uoffcur|doncur)\.bmp\]",
+)
 
 
 class ProbeError(Exception):
@@ -469,6 +487,236 @@ def find_videos(game_root):
     return sorted(out, key=lambda p: p[1])
 
 
+# --- NSA/NS2 archives ------------------------------------------------------
+#
+# Real NScripter games are not supposed to archive their movies, but Chinese
+# repacks and dōjin titles do it anyway.  `gal prep` therefore also opens the
+# root *.nsa/*.ns2, and every entry that either ends in a video extension or
+# sniffs as a movie (RIFF/AVI, the NScripter 'AVI8' wrapper, MPEG pack or
+# sequence start) is extracted to _video/extracted/ and put through the same
+# transcode chain.  The header layout is parsed exactly as the engine reads
+# it (OnscripterYuri/src/onsyuri/{Sar,Direct}Reader.cpp):
+#   NSA: num(u16 BE) base(u32 BE) then per entry  name\0 comp(u8)
+#        offset(u32 BE, +base) length(u32 BE) orig_length(u32 BE)
+#   NS2: base(u32 LE) then per entry  "name" length(u32 LE), data laid
+#        out flat from base, no compression byte.
+# Compressed entries (comp != 0) need the engine's own decoder: the tool
+# nsadec (build: gal/prep/tools/build-nsatools.sh) is used as a fallback when
+# present; without it those entries are reported skipped_compressed, honestly.
+
+NSA_EXTS = (".nsa", ".ns2")
+NSA_EXTRACT_DIR = os.path.join(VIDEO_OUT_DIR, "extracted")
+NSA_SNIFF_BYTES = 4096
+NSADECODE_TIMEOUT = 300
+
+
+class NsaError(Exception):
+    pass
+
+
+def _nsadec_bin():
+    env = os.environ.get("GAL_NSADEC")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__ if "__file__" in globals() else "."))
+    return os.path.join(here, "prep", "tools", "nsadec")
+
+
+def sniff_video_payload(head):
+    """0 for a bare movie at the start, >0 for a wrapper offset to strip,
+    None when the bytes do not look like a movie."""
+    if len(head) < 12:
+        return None
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return 0
+    if head[:4] == b"AVI8":            # NScripter's wrapped-avi in archive
+        i = head.find(b"RIFF", 4)
+        return i if i >= 0 else None
+    if head[:4] == b"\x00\x00\x01\xba":   # MPEG-2 PS pack start
+        return 0
+    if head[:4] == b"\x00\x00\x01\xb3":   # MPEG-1 video sequence header
+        return 0
+    return None
+
+
+def nsa_list_entries(path):
+    """Parse an .nsa/.ns2 header; return [(name, offset, length, comp)]."""
+    ns2 = path.lower().endswith(".ns2")
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if ns2:
+                base = int.from_bytes(f.read(4), "little")
+                if not (0 <= base < size):
+                    raise NsaError("NS2 base_offset 越界")
+                ents = []
+                cur = base
+                while True:
+                    ch = f.read(1)
+                    if not ch:
+                        break
+                    if ch != b'"':
+                        break
+                    nm = bytearray()
+                    while True:
+                        c = f.read(1)
+                        if not c or c == b'"':
+                            break
+                        nm.append(c[0])
+                    ln4 = f.read(4)
+                    if len(ln4) < 4:
+                        break
+                    ln = int.from_bytes(ln4, "little")
+                    name = nm.decode("utf-8", "replace")
+                    ents.append((name, cur, ln, 0))
+                    cur += ln
+                return ents
+            num = int.from_bytes(f.read(2), "big")
+            base = int.from_bytes(f.read(4), "big")
+            if num > 500000 or not (0 <= base < size):
+                raise NsaError(f"NSA 头越界（num={num} base={base}）")
+            ents = []
+            for _ in range(num):
+                nm = bytearray()
+                while True:
+                    c = f.read(1)
+                    if not c:
+                        raise NsaError("NSA 头截断")
+                    if c == b"\x00":
+                        break
+                    nm.append(c[0])
+                comp = f.read(1)[0]
+                off = int.from_bytes(f.read(4), "big") + base
+                ln = int.from_bytes(f.read(4), "big")
+                f.read(4)  # original length
+                name = nm.decode("utf-8", "replace")
+                if off + ln > size:
+                    raise NsaError(f"条目 {name} 越出文件")
+                ents.append((name, off, ln, comp))
+            return ents
+    except NsaError:
+        raise
+    except (OSError, IndexError) as e:
+        raise NsaError(str(e))
+
+
+def nsa_video_entries(game_root):
+    """Archive candidates for this game root.
+
+    Returns (items, broken_archives) where items are
+    (archive_rel, entry_name_norm, offset, length, comp, strip) for every
+    entry that either names itself a movie or sniffs as one, and
+    broken_archives lists archive files whose header did not parse.
+    Compressed movie-named entries carry comp != 0; they are decoded with
+    nsadec later, only when the tool is available."""
+    items, broken = [], []
+    try:
+        names = sorted(n for n in os.listdir(game_root)
+                       if n.lower().endswith(NSA_EXTS))
+    except OSError:
+        return items, broken
+    for arc in names:
+        path = os.path.join(game_root, arc)
+        try:
+            ents = nsa_list_entries(path)
+        except NsaError:
+            broken.append(arc)
+            continue
+        for (name, off, ln, comp) in ents:
+            norm = name.replace("\\", "/")
+            strip = 0
+            if not norm.lower().endswith(VIDEO_EXTS):
+                if comp != 0:
+                    continue     # cannot sniff a compressed payload cheaply
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(off)
+                        head = f.read(min(NSA_SNIFF_BYTES, ln))
+                except OSError:
+                    continue
+                s = sniff_video_payload(head)
+                if s is None:
+                    continue
+                strip = s
+            items.append((arc, norm, off + strip, max(0, ln - strip), comp, strip))
+    return items, broken
+
+
+def strip_extracted(path, n):
+    """Drop an n-byte wrapper (the NScripter 'AVI8' header ahead of RIFF)
+    from a decoded payload, in place.  n==0 is a no-op; an OSError just keeps
+    the file as-is and lets probe/transcode report it honestly."""
+    if not n:
+        return path
+    try:
+        if os.path.getsize(path) <= n:
+            return path
+        tmp = path + ".part"
+        with open(path, "rb") as f:
+            f.seek(n)
+            data = f.read()
+        with open(tmp, "wb") as g:
+            g.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return path
+
+
+def extract_nsa_entry(game_root, arc, name, offset, length, dst_dir):
+    """Write _video/extracted/<arc>!<name> raw (no compression); returns the
+    path.  Idempotent: reused when newer than the archive and intact-sized."""
+    disk_name = (arc + "!" + name).replace("/", "_").replace("\\", "_")
+    dst = os.path.join(dst_dir, disk_name)
+    src = os.path.join(game_root, arc)
+    if (os.path.exists(dst) and os.path.getsize(dst) == length
+            and os.path.getmtime(dst) >= os.path.getmtime(src)):
+        return dst
+    os.makedirs(dst_dir, exist_ok=True)
+    tmp = dst + ".part"
+    with open(src, "rb") as f:
+        f.seek(offset)
+        with open(tmp, "wb") as g:
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                g.write(chunk)
+                remaining -= len(chunk)
+            if remaining:
+                os.unlink(tmp)
+                raise NsaError(f"条目 {name} 在 {arc} 里读不满 {length} 字节")
+    os.replace(tmp, dst)
+    return dst
+
+
+def nsadec_extract_one(game_root, arc, name, dst_dir):
+    """Fallback for compressed entries: run the engine's nsadec in a temp
+    directory (it unpacks the whole archive) and copy just our entry out.
+    Returns the extracted path or raises NsaError."""
+    tool = _nsadec_bin()
+    if not os.path.exists(tool):
+        raise NsaError("压缩条目需要 nsadec（跑 gal/prep/tools/build-nsatools.sh）")
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="gal-nsadec-") as td:
+        try:
+            proc = subprocess.run([tool, os.path.join(game_root, arc)],
+                                  cwd=td, capture_output=True, text=True,
+                                  timeout=NSADECODE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise NsaError(f"nsadec 失败: {e}")
+        want = os.path.join(td, *name.split("/"))
+        if not os.path.exists(want):
+            raise NsaError("nsadec 没解出该条目: " +
+                           (proc.stderr or "").strip()[:120])
+        disk_name = (arc + "!" + name).replace("/", "_").replace("\\", "_")
+        dst = os.path.join(dst_dir, disk_name)
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copyfile(want, dst)
+        return dst
+
+
 def out_name_for(rel, used):
     """_video/<original name>.mp4; on a basename collision the flattened
     relative path is used so two nested movies never share one output.
@@ -549,15 +797,20 @@ def do_prep(game_path, game_name=None, quiet=False):
     map_path = os.path.join(out_dir, VIDEO_MAP_NAME)
 
     rels = find_videos(game_path)
-    map_names = {m for _, m in rels}
+    # nsa/ns2 in the game root are an NScripter trait; scanning the root for
+    # them is a no-op for every other engine.  GAL_PREP_NO_NSA=1 opts out.
+    arch_items, broken_archives = ([], [])
+    if os.environ.get("GAL_PREP_NO_NSA") != "1":
+        arch_items, broken_archives = nsa_video_entries(game_path)
+    loose_names = {m for _, m in rels}
+    map_names = loose_names | {e[1] for e in arch_items}
     prev = {e["from"]: e for e in load_video_map(map_path)}
     # names already committed stay reserved, so a re-run never renames output
     used = {os.path.basename(e["to"]) for e in prev.values()}
-    # entries another producer wrote (source nsa:<archive>#<entry>) survive;
-    # loose entries are recomputed from the folder below
-    merged = {k: v for k, v in prev.items()
-              if not str(v.get("source", "loose")).startswith("loose")
-              and k not in map_names}
+    # entries no producer wrote this pass (e.g. nsa from another tool, or an
+    # archive we skipped via GAL_PREP_NO_NSA) survive; everything we re-scan
+    # below is recomputed from the folder
+    merged = {k: v for k, v in prev.items() if k not in map_names}
 
     def assign_name(map_rel):
         """Reuse the committed name when the mapping still exists; the
@@ -569,18 +822,61 @@ def do_prep(game_path, game_name=None, quiet=False):
             return name
         return out_name_for(map_rel, used)
 
-    for disk_rel, map_rel in rels:
-        src = os.path.join(game_path, disk_rel)
-        dst_name = assign_name(map_rel)
-        dst = os.path.join(out_dir, dst_name)
-        entry = {"file": map_rel, "to": f"{VIDEO_OUT_DIR}/{dst_name}",
-                 "source_codec": None,
+    # one work list, loose first; archive items are shadowed by loose files of
+    # the same script-side name (the game's own copy wins, like at runtime)
+    work = [("loose", map_from, None) for _disk_rel, map_from in rels]
+    extract_dir = os.path.join(out_dir, "extracted")
+    seen_arch = set()
+    for (arc, ename, off, ln, comp, strip) in sorted(arch_items, key=lambda t: t[1]):
+        if ename in loose_names or ename in seen_arch:
+            if ename in seen_arch:
+                entry = {"file": ename, "origin": f"nsa:{arc}#{ename}",
+                         "status": "duplicate", "to": None, "error": None}
+                report["videos"].append(entry)
+            continue
+        seen_arch.add(ename)
+        work.append(("nsa", ename, (arc, off, ln, comp, strip)))
+
+    for kind, map_rel, ainfo in work:
+        entry = {"file": map_rel, "origin": "loose" if kind == "loose"
+                 else f"nsa:{ainfo[0]}#{map_rel}",
+                 "to": None, "source_codec": None,
                  "source_size": None, "sar": None, "dar": None,
                  "fps": None, "duration_sec": None, "status": None,
                  "encoder": None, "elapsed_sec": None, "output_bytes": None,
                  "error": None}
-        if disk_rel != map_rel:
-            entry["disk_file"] = disk_rel
+        dst_name = assign_name(map_rel)
+        dst = os.path.join(out_dir, dst_name)
+        entry["to"] = f"{VIDEO_OUT_DIR}/{dst_name}"
+        if kind == "loose":
+            disk_rel = next(r for r, m in rels if m == map_rel)
+            src = os.path.join(game_path, disk_rel)
+            if disk_rel != map_rel:
+                entry["disk_file"] = disk_rel
+        else:
+            arc, off, ln, comp, strip = ainfo
+            src = None
+            try:
+                if comp == 0:
+                    # off/ln were already moved past the wrapper (e.g. the
+                    # AVI8 header) by nsa_video_entries when it sniffed one
+                    src = extract_nsa_entry(game_path, arc, map_rel, off, ln,
+                                            extract_dir)
+                else:
+                    # nsadec decodes the payload from the archive; sniff it
+                    # again here because the wrapper offset could not be read
+                    # through the compression
+                    src = nsadec_extract_one(game_path, arc, map_rel,
+                                             extract_dir)
+                    with open(src, "rb") as f:
+                        s = sniff_video_payload(f.read(NSA_SNIFF_BYTES))
+                    strip_extracted(src, s or 0)
+                entry["extracted_bytes"] = os.path.getsize(src)
+            except (NsaError, OSError) as e:
+                entry.update(status="extract_failed",
+                             error=_hide_root(str(e), game_path))
+                report["videos"].append(entry)
+                continue
         try:
             info = probe_media(src)
         except ProbeError as e:
@@ -589,7 +885,7 @@ def do_prep(game_path, game_name=None, quiet=False):
             committed = prev.get(map_rel)
             if committed and committed.get("to") == entry["to"] and should_skip(src, dst):
                 merged[map_rel] = {"from": map_rel, "to": entry["to"],
-                                   "codec": "h264", "source": "loose"}
+                                   "codec": "h264", "source": entry["origin"]}
                 entry["output_bytes"] = os.path.getsize(dst)
             entry.update(status="unprobeable", error=_hide_root(str(e), game_path))
             report["videos"].append(entry)
@@ -616,12 +912,23 @@ def do_prep(game_path, game_name=None, quiet=False):
             except OSError:
                 entry["output_bytes"] = None
             merged[map_rel] = {"from": map_rel, "to": entry["to"],
-                           "codec": "h264", "source": "loose"}
+                               "codec": "h264", "source": entry["origin"]}
+        report["videos"].append(entry)
+
+    for arc in broken_archives:
+        entry = {"file": arc, "origin": "archive", "status": "archive_broken",
+                 "to": None, "error": "头解析失败（可能是 key_table 加密或坏档）"}
         report["videos"].append(entry)
 
     map_doc = write_video_map(map_path, list(merged.values()))
-    counts = {"found": len(rels), "transcoded": 0, "skipped": 0,
-              "failed": 0, "unprobeable": 0, "mapped": len(map_doc["mappings"])}
+    # "found" must cover archive entries too, otherwise a game whose only
+    # movies live in arc.nsa reports "共 0 个影片：转码 1".
+    counts = {"found": len(rels) + len(seen_arch), "transcoded": 0, "skipped": 0,
+              "failed": 0, "unprobeable": 0,
+              "found_in_archives": len(seen_arch),
+              "archives": sorted({a[0] for a in arch_items}) ,
+              "broken_archives": broken_archives,
+              "mapped": len(map_doc["mappings"])}
     for v in report["videos"]:
         if v["status"] == "transcoded":
             counts["transcoded"] += 1
@@ -927,6 +1234,19 @@ def cmd_launch(args):
                     print(f"gal: {args.game} 是安装包，还没有装出游戏数据", file=sys.stderr)
                     print("gal: 请指向安装后的目录（含 data*.arc）", file=sys.stderr)
                     return 1
+    # NScripter writes its cross-platform save into <game>/sav/ and silently
+    # gives up when that directory is missing -- it then only keeps the private
+    # ONScripter format next to the script, which the Windows original cannot
+    # read.  Creating it costs nothing and is what makes the saves portable.
+    # (Measured: harness/results.md, "存档落在哪里".)
+    if engine == "nscripter":
+        sav_dir = os.path.join(game["path"], "sav")
+        if not os.path.isdir(sav_dir):
+            try:
+                os.makedirs(sav_dir, exist_ok=True)
+                print(f"gal: 已创建存档目录 {sav_dir}（NScripter 兼容存档写这里）")
+            except OSError as e:
+                print(f"gal: 建不了存档目录 {sav_dir}: {e}", file=sys.stderr)
     argv, cwd = build_command(args.game, game, args.extra)
     # the KiriKiri port processes the framework's timer-driven execution in a loop,
     # so it is given one for as long as the window is up
@@ -1040,8 +1360,10 @@ def cmd_verify(args):
     lowered = [(l, l.lower()) for l in lines]
     errors = [l for l, low in lowered
               if any(m in low for m in VERIFY_ERROR_MARKERS)]
+    warn_res = [re.compile(pat, re.I) for pat in VERIFY_WARN_PATTERNS]
     warns = [l for l, low in lowered
-             if any(m in low for m in VERIFY_WARN_MARKERS)
+             if (any(m in low for m in VERIFY_WARN_MARKERS)
+                 or any(r.search(low) for r in warn_res))
              and not any(m in low for m in VERIFY_ERROR_MARKERS)]
     if proc.returncode not in (None, 0) and not timed_out:
         errors.append(f"engine exited with status {proc.returncode}")
