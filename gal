@@ -75,14 +75,16 @@ ENGINES = {
     },
     "reallive": {
         "label": "RealLive → RLVM",
-        "binary": f"{ENGINES_ROOT}/rlvm/build/rlvm",
-        "state": "partial",
+        # the revived port lives outside this tree, as an app bundle
+        "binary": os.path.expanduser("~/Documents/rlvm/build/rlvm.app/Contents/MacOS/rlvm"),
+        "state": "runnable",
         "signatures": [
             ("Seen.txt", 10), ("Gameexe.ini", 10), ("*.g00", 8),
             ("*.nwk", 6), ("*.koe", 6), ("*.ovk", 6),
         ],
         "extras": [],
-        "notes": "olde C++ that needs its own port; the other session owns it",
+        "notes": "revived for Apple Silicon: SDL3, 260/260 unit tests, an app bundle "
+                 "and a dmg; point it at a folder holding Seen.txt and Gameexe.ini",
     },
     "bgi": {
         "label": "Ethornell/BGI → OpenBGI",
@@ -1429,7 +1431,8 @@ def cmd_doctor(args):
               + ("" if tool not in ("ffmpeg", "ffprobe")
                  else "   (gal prep 需要)"))
     lib = load_library()
-    missing = [n for n, g in lib["games"].items() if not os.path.isdir(g["path"])]
+    # a game may be an archive file rather than a folder
+    missing = [n for n, g in lib["games"].items() if not os.path.exists(g["path"])]
     for n in missing:
         print(f"  ✗ {n}: 目录不在了 ({lib['games'][n]['path']})")
         ok = False
