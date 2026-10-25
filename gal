@@ -255,7 +255,14 @@ def build_command(name, game, extra):
         argv = [binary, "--root", path] + info["extras"]
         return argv, path
     if game["engine"] == "kirikiri":
-        # KAG's project starts at startup.tjs in the game's own folder
+        # a game ships as data.xp3 (or a name of its own); the port can run one
+        archives = sorted(f for f in os.listdir(path) if f.lower().endswith(".xp3")) \
+            if os.path.isdir(path) else []
+        if archives:
+            primary = os.path.join(path, "data.xp3")
+            chosen = primary if os.path.exists(primary) else os.path.join(path, archives[0])
+            return [binary, chosen] + info["extras"], path
+        # otherwise the project's sources sit in the folder, starting at startup.tjs
         entry = os.path.join(path, "startup.tjs")
         if not os.path.exists(entry):
             entry = None
@@ -407,7 +414,9 @@ def cmd_verify(args):
     if not os.path.exists(argv[0]) or not os.path.isdir(cwd):
         print("gal: 二进制或游戏目录不存在", file=sys.stderr)
         return 1
-    env = dict(os.environ, SDL_VIDEODRIVER="dummy", SDL_AUDIODRIVER="dummy")
+    env = dict(run_env if run_env else os.environ)
+    env["SDL_VIDEODRIVER"] = "dummy"
+    env["SDL_AUDIODRIVER"] = "dummy"
     print(f"试跑 {args.seconds}s（无窗口）: {args.game}")
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
