@@ -35,8 +35,23 @@ import sys
 import time
 import unicodedata
 
-ENGINES_ROOT = os.path.expanduser("~/Documents/gal-engines")
+# The engines sit beside this script (gal/gal -> ..), so a checkout works from
+# anywhere; GAL_ENGINES_ROOT overrides it when the engines live elsewhere.
+ENGINES_ROOT = os.environ.get("GAL_ENGINES_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__)))
 LIBRARY = os.path.expanduser("~/Library/Application Support/gal/library.json")
+
+def _reallive_binary():
+    """Where RLVM's app bundle is: beside this tree first, then a checkout of its own."""
+    candidates = [
+        os.path.join(ENGINES_ROOT, "rlvm", "build", "rlvm.app", "Contents", "MacOS", "rlvm"),
+        os.path.expanduser("~/Documents/rlvm/build/rlvm.app/Contents/MacOS/rlvm"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
 
 # ---------------------------------------------------------------------------
 # the engines
@@ -76,7 +91,7 @@ ENGINES = {
     "reallive": {
         "label": "RealLive → RLVM",
         # the revived port lives outside this tree, as an app bundle
-        "binary": os.path.expanduser("~/Documents/rlvm/build/rlvm.app/Contents/MacOS/rlvm"),
+        "binary": _reallive_binary(),
         "state": "runnable",
         "signatures": [
             ("Seen.txt", 10), ("Gameexe.ini", 10), ("*.g00", 8),
