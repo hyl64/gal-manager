@@ -182,8 +182,23 @@ def cmd_engines(args):
 
 def cmd_add(args):
     path = os.path.abspath(os.path.expanduser(args.directory))
+    # a game may be a folder or the archive it ships as
+    if os.path.isfile(path) and path.lower().endswith(".xp3"):
+        name = args.name or os.path.splitext(os.path.basename(path))[0]
+        lib = load_library()
+        lib["games"][name] = {
+            "path": path,
+            "engine": "kirikiri",
+            "evidence": [os.path.basename(path)],
+        }
+        save_library(lib)
+        info = ENGINES["kirikiri"]
+        print(f"已加入: {name}")
+        print(f"  引擎: {info['label']}")
+        print(f"  依据: {os.path.basename(path)}")
+        return 0
     if not os.path.isdir(path):
-        print(f"gal: 不是目录: {path}", file=sys.stderr)
+        print(f"gal: 不是目录，也不是 .xp3 归档: {path}", file=sys.stderr)
         return 1
     engine, evidence, problems = scan_folder(path)
     if problems:
@@ -254,6 +269,8 @@ def build_command(name, game, extra):
     if game["engine"] == "nscripter":
         argv = [binary, "--root", path] + info["extras"]
         return argv, path
+    if game["engine"] == "kirikiri" and os.path.isfile(path):
+        return [binary, path] + info["extras"], info.get("cwd") or os.path.dirname(path)
     if game["engine"] == "kirikiri":
         # a game ships as data.xp3 (or a name of its own); the port can run one
         archives = sorted(f for f in os.listdir(path) if f.lower().endswith(".xp3")) \
@@ -311,8 +328,8 @@ def cmd_launch(args):
         print(f"gal: 引擎二进制不存在: {binary}", file=sys.stderr)
         print("gal: 先在对应引擎目录里构建（见各目录的 BUILD_NOTES.md）", file=sys.stderr)
         return 1
-    if not os.path.isdir(game["path"]):
-        print(f"gal: 游戏目录不在了: {game['path']}", file=sys.stderr)
+    if not os.path.exists(game["path"]):
+        print(f"gal: 游戏不在了: {game['path']}", file=sys.stderr)
         return 1
     # BGI trials ship as installers: the engine boots them and their own boot
     # program then asks for the installation media and quits
@@ -355,14 +372,19 @@ def cmd_launch(args):
         env = dict(os.environ)
         env["BGI_DUMP_STAGE"] = os.path.abspath(args.dump)
         env.setdefault("SDL_VIDEODRIVER", "dummy")
-        pkill = ["pkill", "-9", "-f", "bin/bgi"]
-        subprocess.call(pkill, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
+        # Do not terminate an unrelated game with pkill -f bin/bgi.  If another
+        # instance holds the engine lock, this probe will fail honestly.
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(14)
-        subprocess.call(pkill, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=14)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         ok = os.path.exists(args.dump) and os.path.getsize(args.dump) > 1024
         print(f"gal: {'已导出' if ok else '没有导出'} {args.dump}")
         return 0 if ok else 1
@@ -377,19 +399,6 @@ def cmd_launch(args):
         return 130
 
 
-def kill_stale(engine):
-    """A leftover instance of an engine that keeps an instance lock makes the next
-    run exit on purpose, which would read as a failure.  Clear them first."""
-    if engine != "bgi":
-        return
-    try:
-        subprocess.call(["pkill", "-9", "-f", "bin/bgi"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-    except Exception:
-        pass
-
-
 def cmd_verify(args):
     """Start the engine headless for a few seconds and report what it said."""
     lib = load_library()
@@ -402,7 +411,6 @@ def cmd_verify(args):
     if engine not in RUNNABLE:
         print(f"gal: {info.get('label', engine)} 还跑不了游戏", file=sys.stderr)
         return 1
-    kill_stale(engine)
     argv, cwd = build_command(args.game, game, [])
     # the same environment a launch gets: the KiriKiri port needs its loop to be
     # "still running" at all
@@ -411,7 +419,7 @@ def cmd_verify(args):
         run_env.setdefault("KRKR_LOOP_SECONDS", "600")
     else:
         run_env = None
-    if not os.path.exists(argv[0]) or not os.path.isdir(cwd):
+    if not os.path.exists(argv[0]) or not (os.path.isdir(cwd) or os.path.isfile(cwd)):
         print("gal: 二进制或游戏目录不存在", file=sys.stderr)
         return 1
     env = dict(run_env if run_env else os.environ)
@@ -439,7 +447,16 @@ def cmd_verify(args):
         timed_out = True
     elapsed = time.monotonic() - started
     lines = [l for l in (out or "").splitlines() if l.strip()]
-    errors = [l for l in lines if "error" in l.lower() or "can't open font" in l.lower()]
+    # Survival is not a compatibility test.  Catch explicit engine/script
+    # failures (including KiriKiri's Japanese exception banner) even when the
+    # host keeps its run loop alive or exits with status zero.
+    error_markers = (
+        "error", "can't open font", "krkrrun:",
+        "エラーが発生しました", "does not exist", "exception",
+    )
+    errors = [l for l in lines if any(m in l.lower() for m in error_markers)]
+    if proc.returncode not in (None, 0) and not timed_out:
+        errors.append(f"engine exited with status {proc.returncode}")
     if errors:
         print("  ✗ 有报错:")
         for l in errors[:5]:
