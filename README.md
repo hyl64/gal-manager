@@ -229,3 +229,22 @@ prep；曾成功的源变更后重转失败 → 映射条目被移除，源恢�
 → 报错返回 1；`broken.avi` 这类无视频流文件标记 `unprobeable` 并让 `gal prep` 返回 1，
 但 `gal add` 里的自动 prep 不影响入库。
 
+## gal verify — 判定分级（工作树里的预留位，未提交，等 task-3 语料）
+
+`228eb58`（已被 `e447a8d` revert）把"缺任何文件"都算失败，误杀了官方 demo：
+OnscripterYuri 对可选资源（`cursor0/1.bmp`、`u/d on/offcur.bmp`、`system.lua`）打的
+`*** can't find file [...] ***` 是 BUILD_NOTES 定性过的"无害警告，引擎优雅跳过"。
+分级方案等 T3 的必需资源坏例 stderr 语料 + lead 的白名单定稿后落地，现在先把**空位留好**：
+
+- `VERIFY_ERROR_MARKERS`：判失败的标记，**与 228eb58 之前的旧集合逐字相同**，行为零变更。
+- `VERIFY_WARN_MARKERS`：**目前为空元组**。接入方式是只扩这个元组（或改成按引擎的字典），
+  匹配逻辑不动；warn 行在 table 输出里带 `(可选资源/噪音)` 前缀、在 json 里进
+  `warnings[]`，永不计败。error/warn 互斥（同一行先归 error）。
+- `gal verify <game> --report json`：与 `gal prep --report json` 同风格，字段
+  `game / engine / seconds / elapsed_sec / returncode / timed_out / line_count /
+  verdict(pass|fail) / ok / errors[] / warnings[]`；json 模式不打人类文本，
+  返回码 0=通过、1=不通过。
+- 回归现状：lifegame、SDK 样本、kag3、BGI 体验版在这处改动下全部维持"可以运行"，
+  人类可读输出与旧版逐字一致；`./prep/selftest.sh` 仍全绿。
+
+

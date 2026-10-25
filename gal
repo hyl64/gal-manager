@@ -197,6 +197,31 @@ VIDEO_MAP_VERSION = 1
 PROBE_TIMEOUT = 30
 FFMPEG_TIMEOUT = 900
 
+# ---------------------------------------------------------------------------
+# verify verdict grading  (extensible - placeholder until task-3's corpus)
+# ---------------------------------------------------------------------------
+#
+# `gal verify` counts engine failures against a game.  It must not count the
+# noise an engine makes about resources it can live without: OnscripterYuri
+# prints `*** can't find file [cursor0.bmp] ***` (and the u/d on/offcur.bmp /
+# system.lua siblings) as BUILD_NOTES' "harmless warning, the engine skips it",
+# and a blanket "any missing file fails" rule (228eb58, reverted by e447a8d)
+# mis-killed the official demos that run fine.
+#
+# The split: VERIFY_ERROR_MARKERS fails the run (unchanged behaviour),
+# VERIFY_WARN_MARKERS only gets reported.  It is empty until T3's bad-case
+# stderr corpus and the lead's whitelist proposal land; candidates already
+# seen on real data are the "*** can't find file" family above and
+# decoder chatter like "no decoder"/"invalid data" from probe-style lines.
+# Wire-in point for T3: extend the tuple below (or a per-engine dict), not the
+# matching logic.
+
+VERIFY_ERROR_MARKERS = (
+    "error", "can't open font", "krkrrun:",
+    "エラーが発生しました", "does not exist", "exception",
+)
+VERIFY_WARN_MARKERS = ()
+
 
 class ProbeError(Exception):
     pass
@@ -982,7 +1007,9 @@ def cmd_verify(args):
     env = dict(run_env if run_env else os.environ)
     env["SDL_VIDEODRIVER"] = "dummy"
     env["SDL_AUDIODRIVER"] = "dummy"
-    print(f"试跑 {args.seconds}s（无窗口）: {args.game}")
+    quiet_json = getattr(args, "report", None) == "json"
+    if not quiet_json:
+        print(f"试跑 {args.seconds}s（无窗口）: {args.game}")
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1006,29 +1033,47 @@ def cmd_verify(args):
     lines = [l for l in (out or "").splitlines() if l.strip()]
     # Survival is not a compatibility test.  Catch explicit engine/script
     # failures (including KiriKiri's Japanese exception banner) even when the
-    # host keeps its run loop alive or exits with status zero.
-    error_markers = (
-        "error", "can't open font", "krkrrun:",
-        "エラーが発生しました", "does not exist", "exception",
-    )
-    errors = [l for l in lines if any(m in l.lower() for m in error_markers)]
+    # host keeps its run loop alive or exits with status zero.  Lines matching
+    # VERIFY_WARN_MARKERS are engine noise about optional resources and only
+    # get reported, never counted against the verdict - that set is a graded
+    # placeholder until task-3's corpus and the lead's whitelist land.
+    lowered = [(l, l.lower()) for l in lines]
+    errors = [l for l, low in lowered
+              if any(m in low for m in VERIFY_ERROR_MARKERS)]
+    warns = [l for l, low in lowered
+             if any(m in low for m in VERIFY_WARN_MARKERS)
+             and not any(m in low for m in VERIFY_ERROR_MARKERS)]
     if proc.returncode not in (None, 0) and not timed_out:
         errors.append(f"engine exited with status {proc.returncode}")
+    if errors:
+        verdict, ok = f"✗ 有报错（{len(errors)} 条）", False
+    elif timed_out:
+        verdict, ok = f"✓ 进入主循环（活过 {elapsed:.1f}s）", True
+    elif elapsed < 2.0:
+        verdict, ok = f"⚠ 启动后 {elapsed:.1f}s 就退出：多半缺数据或脚本出错被抑制", False
+    else:
+        verdict, ok = f"✓ 脚本正常结束（跑了 {elapsed:.1f}s）", True
+    if quiet_json:
+        print(json.dumps({
+            "game": args.game, "engine": engine, "seconds": args.seconds,
+            "elapsed_sec": round(elapsed, 2), "returncode": proc.returncode,
+            "timed_out": timed_out, "line_count": len(lines),
+            "verdict": "pass" if ok else "fail", "ok": ok,
+            "errors": [e.strip() for e in errors],
+            "warnings": [w.strip() for w in warns],
+        }, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
     if errors:
         print("  ✗ 有报错:")
         for l in errors[:5]:
             print(f"    {l.strip()}")
         print("  结论: 跑不起来")
         return 1
-    if timed_out:
-        verdict, ok = f"✓ 进入主循环（活过 {elapsed:.1f}s）", True
-    elif elapsed < 2.0:
-        verdict, ok = f"⚠ 启动后 {elapsed:.1f}s 就退出：多半缺数据或脚本出错被抑制", False
-    else:
-        verdict, ok = f"✓ 脚本正常结束（跑了 {elapsed:.1f}s）", True
     print(f"  {verdict} ({len(lines)} 行输出)")
     for l in lines[:3]:
         print(f"    {l.strip()}")
+    for w in warns[:3]:
+        print(f"    (可选资源/噪音) {w.strip()}")
     print(f"  结论: {'可以运行' if ok else '不算跑通'}")
     return 0 if ok else 1
 
@@ -1113,6 +1158,8 @@ def main(argv):
     p = sub.add_parser("verify", help="试跑一个游戏看能不能起来")
     p.add_argument("game")
     p.add_argument("--seconds", type=int, default=5, help="试跑多少秒（默认 5）")
+    p.add_argument("--report", choices=["table", "json"], default="table",
+                   help="table（默认）或 json（含 verdict/errors/warnings，与 gal prep 同风格）")
     p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("remove", help="从库里移除")

@@ -157,6 +157,24 @@ python3 -c 'import os,sys;s,d=sys.argv[1:];t=os.path.getmtime(d)-10;os.utime(s,(
 "$GAL" prep "$BASE/keep" >/dev/null 2>&1
 check "旧映射保留且产物大小照报" python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert [m for m in d["mappings"] if m["from"]=="good.mpg"]' "$BASE/keep/_video/video_map.json"
 
+echo "== 13) verify 分级管道（error/warn 互斥；warn 不计败；MARKERS 即 T3 接入点）"
+python3 - "$GAL" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("galmod", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("galmod", loader))
+loader.exec_module(m)
+assert m.VERIFY_WARN_MARKERS == (), "warn 集应为空占位，等 T3 语料"
+m.VERIFY_WARN_MARKERS = ("*** can't find file", "no decoder")   # 注入候选
+lines = [" *** can't find file [cursor0.bmp] ***", "no decoder for af.mpg",
+         "some error here", "plain output"]
+low = [(l, l.lower()) for l in lines]
+err = [l for l, k in low if any(x in k for x in m.VERIFY_ERROR_MARKERS)]
+warn = [l for l, k in low if any(x in k for x in m.VERIFY_WARN_MARKERS)
+        and not any(x in k for x in m.VERIFY_ERROR_MARKERS)]
+assert err == ["some error here"] and len(warn) == 2, (err, warn)
+PY
+[ $? -eq 0 ] && pass "分级互斥正确，VERIFY_*_MARKERS 即接入点" || fail "分级管道不对"
+
 "$GAL" remove selftest-game >/dev/null 2>&1
 "$GAL" remove selftest-nop  >/dev/null 2>&1
 "$GAL" remove selftest-krk  >/dev/null 2>&1
